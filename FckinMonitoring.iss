@@ -3,7 +3,7 @@
 ; Build exe dulu (lihat hardware_monitor.spec) sebelum compile ini.
 ; =====================================================================
 #define MyAppName "FckinMonitoring"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "3.0.0"
 #define MyAppPublisher "YourName"
 #define MyAppExeName "FckinMonitoring.exe"
 #define MyAppIcon "compile\icon.ico"
@@ -15,7 +15,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
-OutputDir=compile
+OutputDir=versions
 OutputBaseFilename={#MyAppName}-Setup-{#MyAppVersion}
 SetupIconFile={#MyAppIcon}
 Compression=lzma2
@@ -33,8 +33,11 @@ Name: "desktopicon"; Description: "Buat shortcut di Desktop"; GroupDescription: 
 Name: "startupicon"; Description: "Jalankan otomatis saat Windows startup"; GroupDescription: "Opsi startup:"
 
 [Files]
-Source: "compile\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "assets\icon.png"; DestDir: "{app}\assets"; Flags: ignoreversion
+; Seluruh isi folder On-Directory PyInstaller (Executable + _internal)
+Source: "compile\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+; Asset tambahan (seperti icon.png)
+Source: "assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#MyAppExeName}"

@@ -8,7 +8,7 @@ Struktur proyek:
     hardware_monitor.py  -> file ini
 
 Install dependency:
-    pip install PyQt6 psutil pywin32 WMI mss numpy pythonnet
+    pip install PyQt6 psutil pywin32 WMI mss numpy
 
 Jalankan:
     python hardware_monitor.py
@@ -30,23 +30,20 @@ Win32_PerfFormattedData_GPUPerformanceCounters_GPUEngine).
 Ini didukung native oleh Windows 10/11 untuk semua vendor GPU
 (Nvidia/AMD/Intel) TANPA perlu driver/DLL vendor tambahan.
 
-CATATAN SUHU CPU (urutan prioritas sumber):
-  1. LibreHardwareMonitorLib.dll IN-PROCESS via pythonnet (UTAMA) - akurat
-     & real-time, TANPA proses terpisah. Wajib taruh file DLL di:
-         libs/LibreHardwareMonitorLib.dll
-     Download dari rilis "portable" (bukan installer) di:
-         https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases
-  2. LibreHardwareMonitor.exe / OpenHardwareMonitor.exe via WMI (fallback,
-     hanya kepakai kalau kamu jalankan aplikasi itu manual terpisah).
-  3. MSAcpi_ThermalZoneTemperature / ACPI (LAST RESORT) - nilainya sering
-     cache/statis, TIDAK real-time. Cuma dipakai kalau 1 & 2 gagal total.
-Aplikasi ini WAJIB berjalan sebagai Administrator (auto-elevate lewat UAC
-saat start) karena driver sensor (WinRing0) butuh privilege tinggi.
+CATATAN: FITUR SUHU CPU SUDAH DIHAPUS.
+Sebelumnya suhu dibaca lewat LibreHardwareMonitorLib/WMI/ACPI, tapi
+sumber-sumber itu butuh driver kernel (WinRing0) yang sering diblokir
+oleh Memory Integrity/Secure Boot di laptop modern sehingga selalu
+tampil N/A. Karena suhu dihapus, aplikasi ini JUGA TIDAK PERLU LAGI
+berjalan sebagai Administrator - tidak ada auto-elevate/UAC lagi,
+start-up jadi lebih cepat.
 
 CATATAN FPS:
 FPS adalah ESTIMASI ringan berbasis screen-diff sampling pada
 area window yang sedang aktif (foreground), BUKAN hook/inject
-seperti RTSS, sehingga aman dari deteksi anti-cheat.
+seperti RTSS, sehingga aman dari deteksi anti-cheat. Sampling FPS
+berjalan di THREAD TERPISAH dari CPU/RAM/GPU, supaya label CPU/RAM/GPU
+tetap update cepat (tidak ikut menunggu jendela sampling FPS).
 =====================================================================
 """
 
@@ -54,7 +51,6 @@ import sys
 import os
 import time
 import logging
-import ctypes
 
 import psutil
 from PyQt6.QtWidgets import (
@@ -65,7 +61,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QFont, QIcon
 
 # ---------------------------------------------------------------
-# WMI (untuk GPU usage & fallback CPU temperature) - fitur khusus Windows
+# WMI (untuk GPU usage) - fitur khusus Windows
 # ---------------------------------------------------------------
 WMI_AVAILABLE = True
 try:
@@ -73,21 +69,6 @@ try:
     import pythoncom
 except Exception:
     WMI_AVAILABLE = False
-
-# ---------------------------------------------------------------
-# pythonnet (clr) - untuk baca LibreHardwareMonitorLib.dll IN-PROCESS.
-# Ini sumber suhu CPU UTAMA & PALING AKURAT: tanpa perlu menjalankan
-# LibreHardwareMonitor.exe terpisah, tanpa WMI/COM, tanpa proses
-# background tambahan -> tetap ringan.
-# Install: pip install pythonnet
-# DLL: taruh LibreHardwareMonitorLib.dll di folder libs/ (lihat catatan
-# di bawah _init_temp).
-# ---------------------------------------------------------------
-try:
-    import clr  # noqa: F401  (import awal saja untuk cek ketersediaan pythonnet)
-    _PYTHONNET_OK = True
-except Exception:
-    _PYTHONNET_OK = False
 
 # ---------------------------------------------------------------
 # FPS estimator ringan (screen-diff sampling, tanpa hook/inject)
@@ -104,44 +85,6 @@ try:
     _WIN32GUI_OK = True
 except Exception:
     _WIN32GUI_OK = False
-
-
-def _is_admin():
-    try:
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
-def _ensure_admin():
-    """
-    WMI query untuk suhu CPU (root\\wmi ACPI, dan seringnya juga
-    root\\LibreHardwareMonitor / root\\OpenHardwareMonitor) butuh
-    proses yang menjalankannya berjalan dengan privilege Administrator.
-    Tanpa ini, query akan gagal DIAM-DIAM (exception ditangkap) dan
-    TEMP selalu tampil N/A meski sumbernya sebenarnya tersedia.
-
-    Untuk exe hasil build PyInstaller, UAC sudah otomatis diminta lewat
-    manifest (lihat hardware_monitor.spec: uac_admin=True), jadi fungsi
-    ini di-skip. Untuk mode development (python hardware_monitor.py),
-    fungsi ini me-relaunch proses dengan hak admin lalu keluar dari
-    proses lama yang non-admin.
-    """
-    if getattr(sys, "frozen", False):
-        return  # exe: elevation ditangani oleh manifest PyInstaller
-
-    if _is_admin():
-        return
-
-    logging.info("Belum berjalan sebagai Administrator, mencoba auto-elevate (UAC)...")
-    try:
-        script = os.path.abspath(sys.argv[0])
-        params = " ".join(f'"{a}"' for a in sys.argv[1:])
-        cmd = f'"{script}" {params}'.strip()
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, cmd, None, 1)
-    except Exception as e:
-        logging.error(f"Auto-elevate gagal: {e}. Suhu CPU kemungkinan besar akan N/A.")
-    sys.exit(0)
 
 
 def _log_path():
@@ -200,7 +143,7 @@ class FPSEstimator:
             "width": w, "height": h,
         }
 
-    def estimate(self, sample_time=0.5):
+    def estimate(self, sample_time=0.4):
         if not _MSS_OK:
             return 0
         self._ensure_sct()
@@ -220,140 +163,29 @@ class FPSEstimator:
             return 0
 
 
-class LibreTempReader:
-    """
-    Baca suhu CPU langsung dari LibreHardwareMonitorLib.dll SECARA IN-PROCESS,
-    lewat pythonnet (clr). TIDAK menjalankan LibreHardwareMonitor.exe sebagai
-    proses terpisah, TIDAK pakai WMI/COM sama sekali.
-
-    Kenapa ini lebih ringan & lebih akurat daripada jalur WMI:
-    - Tidak ada proses ke-2 yang harus selalu running (hemat RAM/CPU)
-    - Tidak ada overhead marshalling COM/WMI
-    - Data sensor diambil real-time langsung dari driver di proses kita sendiri
-
-    Setup:
-    1. pip install pythonnet
-    2. Download LibreHardwareMonitor (versi "portable", BUKAN installer)
-       dari: https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/releases
-    3. Dari isi ZIP-nya, ambil file "LibreHardwareMonitorLib.dll" saja
-       (dan "HidSharp.dll" jika ada di folder yang sama) -> taruh di:
-           libs/LibreHardwareMonitorLib.dll
-           libs/HidSharp.dll   (jika tersedia)
-       Ini HANYA menyalin 1-2 file DLL, bukan instalasi aplikasi.
-
-    Penyebab error paling umum (pythonnet + LibreHardwareMonitorLib):
-    - Python HARUS versi 64-bit (DLL-nya x64). Cek: python -c "import struct;print(struct.calcsize('P')*8)"
-    - HARUS jalan sebagai Administrator (driver kernel WinRing0 butuh privilege
-      tinggi) -> sudah otomatis ditangani oleh _ensure_admin() di file ini.
-    - "HidSharp.dll" hilang -> beberapa versi LHM butuh file ini di folder yang sama.
-    - Bentrok dengan MSI Center / software vendor lain yang pegang driver sensor
-      yang sama -> tutup dulu software sejenis (MSI Center, HWiNFO, dll).
-    - Versi pythonnet lama tidak cocok dengan DLL target .NET terbaru ->
-      pastikan pythonnet versi terbaru: pip install -U pythonnet
-    """
-
-    def __init__(self, dll_dir):
-        self.available = False
-        self.computer = None
-        self._Hardware = None
-
-        if not _PYTHONNET_OK:
-            logging.warning("pythonnet ('clr') tidak terinstall -> pip install pythonnet")
-            return
-
-        dll_path = os.path.join(dll_dir, "LibreHardwareMonitorLib.dll")
-        if not os.path.exists(dll_path):
-            logging.warning(f"LibreHardwareMonitorLib.dll tidak ditemukan di: {dll_path}")
-            return
-
-        try:
-            import clr
-            clr.AddReference(dll_path)
-            from LibreHardwareMonitor import Hardware  # noqa: N811 (nama namespace .NET)
-
-            self._Hardware = Hardware
-            self.computer = Hardware.Computer()
-            self.computer.IsCpuEnabled = True
-            self.computer.Open()
-            self.available = True
-            logging.info("LibreHardwareMonitorLib berhasil di-load IN-PROCESS (tanpa proses terpisah).")
-        except Exception as e:
-            logging.error(f"Gagal load LibreHardwareMonitorLib.dll: {e}")
-            self.available = False
-
-    def read_cpu_temp(self):
-        if not self.available:
-            return None
-        try:
-            best = None
-            for hw in self.computer.Hardware:
-                # Logging untuk memantau semua hardware yang terdeteksi
-                logging.info(f"HW: {hw.Name} type={hw.HardwareType}")
-                
-                if hw.HardwareType != self._Hardware.HardwareType.Cpu:
-                    continue
-                
-                hw.Update()
-                for sensor in hw.Sensors:
-                    # Logging untuk memantau semua sensor yang ada di dalam CPU
-                    logging.info(f"  Sensor: {sensor.Name} type={sensor.SensorType} value={sensor.Value}")
-                    
-                    if sensor.SensorType != self._Hardware.SensorType.Temperature:
-                        continue
-                    if sensor.Value is None:
-                        continue
-                    
-                    name = (sensor.Name or "").lower()
-                    val = float(sensor.Value)
-                    
-                    if "package" in name:
-                        return val  # paling representatif, langsung dipakai
-                    if best is None or val > best:
-                        best = val  # fallback: suhu core tertinggi
-            return best
-        except Exception as e:
-            logging.warning(f"Gagal baca sensor LibreHardwareMonitorLib in-process, reset: {e}")
-            self.available = False
-            return None
-
-    def close(self):
-        try:
-            if self.computer:
-                self.computer.Close()
-        except Exception:
-            pass
-
 # ---------------------------------------------------------------
-# Worker thread: polling data sistem secara berkala (hemat resource)
+# Worker thread: polling CPU/RAM/GPU secara berkala (hemat resource).
+# Sengaja TIDAK menyertakan FPS di sini, supaya loop ini bisa jalan
+# cepat & konsisten tanpa terhambat jendela sampling FPS (lihat
+# FPSWorker di bawah, jalan di thread terpisah).
 # ---------------------------------------------------------------
 class MonitorWorker(QThread):
     data_ready = pyqtSignal(dict)
 
-    def __init__(self, interval=1.0):
+    def __init__(self, interval=0.4):
         super().__init__()
         self.interval = interval
         self._running = True
-        self.fps_est = FPSEstimator()
-        self.flags = {"cpu": True, "ram": True, "gpu": True, "temp": True, "fps": True}
+        self.flags = {"cpu": True, "ram": True, "gpu": True}
         self._wmi_gpu = None
-        self._wmi_lhm = None
-        self._wmi_therm = None
-        self.libre_temp = None  # LibreTempReader in-process (sumber suhu utama)
-        self.temp_mode = None
-        # --- Auto-retry state untuk koneksi suhu CPU ---
-        # Jika LibreHardwareMonitor baru dibuka setelah overlay jalan (atau
-        # ditutup di tengah jalan), worker akan otomatis mencoba re-connect
-        # secara periodik tanpa membebani loop utama (bukan retry tiap frame).
-        self._last_temp_retry = 0.0
-        self._temp_retry_interval = 5.0  # detik antar percobaan re-connect
 
     def run(self):
         # WMI/COM wajib di-inisialisasi di thread yang memakainya
         if WMI_AVAILABLE:
             pythoncom.CoInitialize()
         self._init_gpu()
-        self._init_temp()
-        self._last_temp_retry = time.time()  # tandai percobaan awal, retry berikutnya menunggu interval
+        # Panggilan pertama psutil.cpu_percent hanya untuk baseline
+        psutil.cpu_percent(interval=None)
         try:
             while self._running:
                 data = {}
@@ -363,20 +195,8 @@ class MonitorWorker(QThread):
                     data["ram"] = psutil.virtual_memory().percent
                 if self.flags.get("gpu"):
                     data["gpu"] = self._get_gpu_usage()
-                if self.flags.get("temp"):
-                    # Auto-retry: kalau belum ada sumber suhu (mis. LibreHardwareMonitor
-                    # baru dibuka belakangan), coba re-init tiap _temp_retry_interval detik.
-                    # Tidak dilakukan tiap frame supaya tidak membebani UI/CPU.
-                    if self.temp_mode is None and (time.time() - self._last_temp_retry) >= self._temp_retry_interval:
-                        logging.info("Auto-retry: mencoba re-connect ke sumber suhu CPU...")
-                        self._init_temp()
-                        self._last_temp_retry = time.time()
-                    data["temp"] = self._get_cpu_temp()
-                if self.flags.get("fps"):
-                    data["fps"] = self.fps_est.estimate(sample_time=min(0.5, self.interval))
                 self.data_ready.emit(data)
-                fps_cost = 0.5 if self.flags.get("fps") else 0
-                time.sleep(max(0.1, self.interval - fps_cost))
+                time.sleep(max(0.1, self.interval))
         finally:
             if WMI_AVAILABLE:
                 pythoncom.CoUninitialize()
@@ -404,151 +224,42 @@ class MonitorWorker(QThread):
         except Exception:
             return None
 
-    # ---- CPU Temperature: in-process (utama) -> WMI LHM/OHM -> ACPI (last resort) ----
-    def _init_temp(self):
-        # 1) In-process via pythonnet - PALING RINGAN & AKURAT, tanpa proses terpisah
-        if self.libre_temp is None:
-            dll_dir = resource_path("libs")
-            self.libre_temp = LibreTempReader(dll_dir)
-        if self.libre_temp.available:
-            self.temp_mode = "libre_inproc"
-            return
+    def stop(self):
+        self._running = False
+        self.wait(1000)
 
-        if not WMI_AVAILABLE:
-            logging.warning("Modul 'wmi'/'pythoncom' tidak tersedia, temp dinonaktifkan.")
-            self.temp_mode = None
-            return
 
-        # 2) Fallback: LibreHardwareMonitor.exe / OpenHardwareMonitor.exe terpisah via WMI
-        #    (dipakai HANYA jika kamu memang menjalankan aplikasi itu secara manual)
-        try:
-            lhm = wmi.WMI(namespace="root\\LibreHardwareMonitor")
-            sensors = lhm.Sensor()
-            temp_sensors = [s.Name for s in sensors if s.SensorType == "Temperature"]
-            if temp_sensors:
-                self._wmi_lhm = lhm
-                self.temp_mode = "lhm"
-                logging.info(f"Temp source: LibreHardwareMonitor (WMI). Sensor: {temp_sensors}")
-                return
-        except Exception as e:
-            logging.info(f"LibreHardwareMonitor WMI tidak tersedia: {e}")
+# ---------------------------------------------------------------
+# Worker thread TERPISAH khusus FPS. Sampling screen-diff butuh waktu
+# (mis. ~0.4 detik per sampel) supaya hasilnya cukup stabil, jadi kalau
+# digabung ke loop utama CPU/RAM/GPU jadi ikut lambat. Dengan thread
+# sendiri, FPS tetap update rutin tanpa bikin CPU/RAM/GPU nunggu.
+# ---------------------------------------------------------------
+class FPSWorker(QThread):
+    fps_ready = pyqtSignal(int)
 
-        try:
-            ohm = wmi.WMI(namespace="root\\OpenHardwareMonitor")
-            sensors = ohm.Sensor()
-            temp_sensors = [s.Name for s in sensors if s.SensorType == "Temperature"]
-            if temp_sensors:
-                self._wmi_lhm = ohm
-                self.temp_mode = "lhm"
-                logging.info(f"Temp source: OpenHardwareMonitor (WMI). Sensor: {temp_sensors}")
-                return
-        except Exception as e:
-            logging.info(f"OpenHardwareMonitor WMI tidak tersedia: {e}")
+    def __init__(self, sample_time=0.4):
+        super().__init__()
+        self.sample_time = sample_time
+        self._running = True
+        self._enabled = True
+        self.fps_est = FPSEstimator()
 
-        # 3) LAST RESORT: ACPI ThermalZone bawaan Windows.
-        #    PERINGATAN: nilainya sering cache/statis, TIDAK real-time.
-        #    Hanya dipakai kalau semua sumber di atas gagal, lebih baik ada
-        #    angka kasar daripada N/A terus.
-        try:
-            therm = wmi.WMI(namespace="root\\wmi")
-            zones = therm.MSAcpi_ThermalZoneTemperature()
-            if zones:
-                self._wmi_therm = therm
-                self.temp_mode = "acpi"
-                logging.info("Temp source: ACPI ThermalZone (root\\wmi) - CATATAN: nilai mungkin tidak real-time.")
-                return
-        except Exception as e:
-            logging.info(f"ACPI ThermalZone tidak tersedia: {e}")
+    def run(self):
+        while self._running:
+            if self._enabled:
+                fps = self.fps_est.estimate(sample_time=self.sample_time)
+                if self._running:
+                    self.fps_ready.emit(fps)
+            else:
+                time.sleep(0.2)
 
-        logging.error(
-            "Tidak ada sumber suhu CPU yang terdeteksi. Pastikan libs/LibreHardwareMonitorLib.dll "
-            "ada dan aplikasi berjalan sebagai Administrator."
-        )
-        self.temp_mode = None
-
-    def _get_cpu_temp(self):
-        """
-        Baca suhu CPU dari sumber aktif (LibreHardwareMonitor/OpenHardwareMonitor
-        atau ACPI). Pencarian nama sensor dibuat fleksibel karena LibreHardwareMonitor
-        menamai sensor berbeda-beda tergantung platform CPU. Untuk Intel Gen 13
-        (Raptor Lake, mis. i5-13500H di MSI Prestige 14 Evo) sensor "package" yang
-        eksplisit kadang tidak ada / namanya cuma "Package" atau "CPU Core #1",
-        jadi dicari bertingkat: package -> keyword umum -> max dari core individual
-        -> sensor apa pun yang menyebut "cpu" -> sensor temperature pertama.
-
-        Jika koneksi ke provider WMI mati (mis. LibreHardwareMonitor ditutup user),
-        exception ditangkap, self.temp_mode di-reset ke None supaya loop run()
-        otomatis mencoba re-connect di siklus retry berikutnya.
-        """
-        try:
-            if self.temp_mode == "libre_inproc" and self.libre_temp:
-                val = self.libre_temp.read_cpu_temp()
-                if val is None and not self.libre_temp.available:
-                    # DLL/driver bermasalah di tengah jalan -> reset supaya di-retry
-                    raise RuntimeError("LibreTempReader in-process tidak lagi available")
-                return val
-
-            elif self.temp_mode == "lhm" and self._wmi_lhm:
-                sensors = self._wmi_lhm.Sensor()
-                temp_sensors = [s for s in sensors if s.SensorType == "Temperature"]
-                if not temp_sensors:
-                    raise RuntimeError("Sensor Temperature kosong (provider mungkin baru ditutup)")
-
-                # Prioritas 1: sensor yang eksplisit menyebut "package"
-                for s in temp_sensors:
-                    if "package" in (s.Name or "").lower():
-                        return float(s.Value)
-
-                # Prioritas 2: keyword umum untuk suhu CPU keseluruhan
-                # (beda vendor/skema penamaan LHM beda-beda)
-                keywords = ("cpu average", "core average", "core max", "tctl", "tdie")
-                for keyword in keywords:
-                    for s in temp_sensors:
-                        if keyword in (s.Name or "").lower():
-                            return float(s.Value)
-
-                # Prioritas 3: ambil nilai tertinggi dari core individual
-                # (umum di Intel Gen 13/Raptor Lake: "CPU Core #1", "CPU Core #2", dst.
-                # Suhu core tertinggi paling merepresentasikan beban CPU saat ini.)
-                core_values = [
-                    float(s.Value) for s in temp_sensors
-                    if "core" in (s.Name or "").lower() and "cpu" in (s.Name or "").lower()
-                ]
-                if core_values:
-                    return max(core_values)
-
-                # Prioritas 4: sensor apa pun yang menyebut "cpu"
-                cpu_values = [float(s.Value) for s in temp_sensors if "cpu" in (s.Name or "").lower()]
-                if cpu_values:
-                    return max(cpu_values)
-
-                # Prioritas 5 (last resort): sensor temperature pertama yang tersedia,
-                # daripada tetap tampil N/A padahal datanya sebenarnya ada.
-                return float(temp_sensors[0].Value)
-
-            elif self.temp_mode == "acpi" and self._wmi_therm:
-                zones = self._wmi_therm.MSAcpi_ThermalZoneTemperature()
-                if not zones:
-                    raise RuntimeError("ACPI ThermalZone kosong")
-                return (zones[0].CurrentTemperature / 10.0) - 273.15
-
-        except Exception as e:
-            # Koneksi ke provider (LibreHardwareMonitor/OpenHardwareMonitor/ACPI)
-            # terputus atau providernya ditutup -> reset state supaya di-retry lagi
-            # secara otomatis oleh loop run() tanpa perlu restart aplikasi.
-            logging.warning(f"Sumber suhu CPU terputus, reset untuk auto-retry. Alasan: {e}")
-            self.temp_mode = None
-            self._wmi_lhm = None
-            self._wmi_therm = None
-            self._last_temp_retry = time.time()  # cegah retry langsung di siklus berikutnya
-
-        return None
+    def set_enabled(self, enabled: bool):
+        self._enabled = enabled
 
     def stop(self):
         self._running = False
         self.wait(1000)
-        if self.libre_temp:
-            self.libre_temp.close()
 
 
 # ---------------------------------------------------------------
@@ -574,9 +285,8 @@ class MonitorWidget(QWidget):
         self.lbl_cpu = QLabel("CPU --%")
         self.lbl_ram = QLabel("RAM --%")
         self.lbl_gpu = QLabel("GPU --%")
-        self.lbl_temp = QLabel("TEMP --\u00b0C")
         self.lbl_fps = QLabel("FPS --")
-        for lbl in (self.lbl_cpu, self.lbl_ram, self.lbl_gpu, self.lbl_temp, self.lbl_fps):
+        for lbl in (self.lbl_cpu, self.lbl_ram, self.lbl_gpu, self.lbl_fps):
             lbl.setFont(font)
             lbl.setStyleSheet("color: white;")
             layout.addWidget(lbl)
@@ -593,6 +303,7 @@ class MonitorWidget(QWidget):
         painter.drawRoundedRect(self.rect(), 10, 10)
 
     def update_data(self, data):
+        """Update label CPU/RAM/GPU (dipanggil dari MonitorWorker)."""
         def set_label(lbl, key, fmt, suffix_na):
             if key in data:
                 val = data[key]
@@ -604,8 +315,18 @@ class MonitorWidget(QWidget):
         set_label(self.lbl_cpu, "cpu", "CPU {:.0f}%", "CPU N/A")
         set_label(self.lbl_ram, "ram", "RAM {:.0f}%", "RAM N/A")
         set_label(self.lbl_gpu, "gpu", "GPU {:.0f}%", "GPU N/A")
-        set_label(self.lbl_temp, "temp", "TEMP {:.0f}\u00b0C", "TEMP N/A")
-        set_label(self.lbl_fps, "fps", "FPS {:.0f}", "FPS N/A")
+        self.adjustSize()
+
+    def update_fps(self, fps):
+        """Update label FPS (dipanggil dari FPSWorker, thread terpisah)."""
+        self.lbl_fps.setText(f"FPS {fps:.0f}" if fps is not None else "FPS N/A")
+        self.lbl_fps.setVisible(True)
+        self.adjustSize()
+
+    def set_fps_visible(self, visible: bool):
+        """Sembunyikan/tampilkan label FPS langsung saat di-toggle dari Settings,
+        tanpa perlu menunggu FPSWorker emit lagi (worker bisa saja sedang di-pause)."""
+        self.lbl_fps.setVisible(visible)
         self.adjustSize()
 
     def set_clickthrough(self, enabled: bool):
@@ -671,8 +392,7 @@ class SettingsWidget(QWidget):
 
         self.checks = {}
         for key, label in [("cpu", "CPU Usage"), ("ram", "RAM Usage"),
-                            ("gpu", "GPU Usage"), ("temp", "CPU Temperature"),
-                            ("fps", "FPS Estimate")]:
+                            ("gpu", "GPU Usage"), ("fps", "FPS Estimate")]:
             cb = QCheckBox(label)
             cb.setChecked(True)
             cb.setStyleSheet("color: white;")
@@ -684,7 +404,7 @@ class SettingsWidget(QWidget):
         hint.setStyleSheet("color: #888; font-size: 10px;")
         layout.addWidget(hint)
 
-        self.resize(260, 230)
+        self.resize(260, 200)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -734,9 +454,15 @@ class OverlayApp:
         self.monitor_widget = MonitorWidget()
         self.settings_widget = SettingsWidget(self.on_toggle_metric, self.set_closed_state)
 
-        self.worker = MonitorWorker(interval=1.0)
+        # CPU/RAM/GPU: loop cepat & ringan, tidak terikat sampling FPS.
+        self.worker = MonitorWorker(interval=0.4)
         self.worker.data_ready.connect(self.monitor_widget.update_data)
         self.worker.start()
+
+        # FPS: thread terpisah supaya tidak menahan update CPU/RAM/GPU.
+        self.fps_worker = FPSWorker(sample_time=0.4)
+        self.fps_worker.fps_ready.connect(self.monitor_widget.update_fps)
+        self.fps_worker.start()
 
         self.is_open = False
         self.set_closed_state()
@@ -765,7 +491,14 @@ class OverlayApp:
             self.toggle()
 
     def on_toggle_metric(self, key, enabled):
-        self.worker.flags[key] = enabled
+        if key == "fps":
+            self.fps_worker.set_enabled(enabled)
+            if not enabled:
+                # Worker fps sedang di-pause, jadi sembunyikan label langsung
+                # tanpa menunggu emit berikutnya (yang tidak akan datang).
+                self.monitor_widget.set_fps_visible(False)
+        else:
+            self.worker.flags[key] = enabled
 
     def _center_settings(self):
         screen_geo = QApplication.primaryScreen().geometry()
@@ -797,6 +530,7 @@ class OverlayApp:
 
     def quit_app(self):
         self.worker.stop()
+        self.fps_worker.stop()
         self.tray.hide()
         self.app.quit()
 
@@ -806,6 +540,5 @@ class OverlayApp:
 
 
 if __name__ == "__main__":
-    _ensure_admin()
-    logging.info(f"Aplikasi mulai. Berjalan sebagai Administrator: {_is_admin()}")
+    logging.info("Aplikasi mulai (tanpa elevasi Administrator - tidak diperlukan lagi).")
     OverlayApp().run()
