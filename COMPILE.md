@@ -4,7 +4,7 @@
 Jalankan perintah berikut pada terminal PowerShell Anda untuk memaketkan skrip Python:
 
 ```powershell
-pyinstaller hardware_monitor.spec --distpath versions --workpath build --noconfirm
+pyinstaller hardware_monitor.spec --distpath compile --workpath build --noconfirm
 ```
 
 ## 2. Pembuatan Installer (Inno Setup)
